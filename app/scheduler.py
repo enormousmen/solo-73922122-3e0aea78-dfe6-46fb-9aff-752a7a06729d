@@ -13,6 +13,11 @@ Design notes
 * The first valid artifact observed for a segment wins. Every other attempt of
   that segment is cancelled; any success that still arrives later is recorded
   but its file is discarded and never replaces the selection.
+* Integrity probing never runs under the state lock. When a process exits its
+  slot is released immediately and a zero-exit attempt becomes "probing": the
+  artifact is verified on a detached thread and the attempt is settled exactly
+  once when the verdict lands. A slow or hung probe therefore cannot freeze
+  batch queries, dispatch, or slot accounting.
 * Once all three segments have a selection, composition starts immediately in
   a separate thread. It only reads the immutable selected artifacts, so it is
   allowed to run while cancelled processes are still exiting.
@@ -35,7 +40,9 @@ from .config import Settings
 TERMINAL_ATTEMPT_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "superseded", "skipped"}
 )
-LIVE_ATTEMPT_STATUSES = frozenset({"queued", "running", "cancelling"})
+# "probing" is live: the process has exited and its slot is free, but the
+# segment is still undecided until the off-lock integrity probe lands.
+LIVE_ATTEMPT_STATUSES = frozenset({"queued", "running", "cancelling", "probing"})
 
 
 def pick_next_candidate(
@@ -336,7 +343,7 @@ class BatchManager:
             self._stopping = True
             for batch in self._batches.values():
                 for attempt in batch.attempts():
-                    if attempt.status in ("running", "cancelling"):
+                    if attempt.status in ("running", "cancelling", "probing"):
                         self._request_cancel(attempt, "应用正在停止")
                     elif attempt.status == "queued":
                         attempt.status = "skipped"
@@ -375,7 +382,7 @@ class BatchManager:
                 batch.error = message
                 batch.finished_at = time.time()
             for attempt in batch.attempts():
-                if attempt.status in ("running", "cancelling"):
+                if attempt.status in ("running", "cancelling", "probing"):
                     self._request_cancel(attempt, "调度器内部错误")
                 elif attempt.status == "queued":
                     attempt.status = "skipped"
@@ -491,7 +498,7 @@ class BatchManager:
         for returncode, _order, batch, attempt in exited:
             if attempt.status not in ("running", "cancelling"):
                 continue
-            self._finalize_attempt(batch, attempt, returncode, now)
+            self._reap_exited(batch, attempt, returncode, now)
 
     @staticmethod
     def _artifact_mtime(attempt: Attempt) -> float:
@@ -502,9 +509,17 @@ class BatchManager:
             pass
         return float("inf")
 
-    def _finalize_attempt(
+    def _reap_exited(
         self, batch: Batch, attempt: Attempt, returncode: int, now: float
     ) -> None:
+        """Bookkeep one exited process, then settle it without blocking.
+
+        The slot is released here: it belongs to the live process, which is
+        gone. A zero exit still has to pass the integrity probe, which can be
+        slow, so that verdict is produced off-lock (see ``_start_probe``) and
+        applied later; a non-zero exit needs no probe and is final now.
+        """
+
         attempt.exit_code = returncode
         attempt.finished_at = now
         attempt.proc = None
@@ -515,15 +530,100 @@ class BatchManager:
             attempt.slot_held = False
             self._slots_used = max(0, self._slots_used - 1)
 
+        if returncode == 0:
+            attempt.status = "probing"
+            self._start_probe(batch, attempt)
+            return
+        self._finalize_attempt(batch, attempt, returncode, now, artifact_ok=False)
+
+    # -- off-lock integrity probe -------------------------------------------
+
+    def _start_probe(self, batch: Batch, attempt: Attempt) -> None:
+        """Verify the artifact on a detached daemon thread.
+
+        The attempt stays in the non-terminal "probing" status until the
+        verdict lands, so nothing else can finalize it meanwhile.
+        """
+
+        thread = threading.Thread(
+            target=self._probe_and_finalize,
+            args=(batch.id, attempt.id, attempt.artifact_path),
+            name=f"probe-{attempt.id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _probe_and_finalize(
+        self, batch_id: str, attempt_id: str, artifact_path: Path | None
+    ) -> None:
+        # The slow part happens here, without the state lock: queries,
+        # dispatch and slot accounting keep moving while a probe stalls.
+        artifact_ok = self._probe_artifact(artifact_path)
+        with self._cond:
+            batch = self._batches.get(batch_id)
+            attempt = self._find_attempt(batch, attempt_id)
+            if attempt is None or attempt.status != "probing":
+                # Already settled elsewhere; a probe verdict must never
+                # finalize an attempt twice or resurrect a cancelled one.
+                return
+            self._finalize_attempt(
+                batch,
+                attempt,
+                attempt.exit_code if attempt.exit_code is not None else 0,
+                time.time(),
+                artifact_ok=artifact_ok,
+            )
+            self._cond.notify_all()
+
+    def _probe_artifact(self, artifact_path: Path | None) -> bool:
+        """Integrity-check one artifact; never called with the lock held."""
+
+        if artifact_path is None:
+            return False
+        stall = self.settings.probe_stall_seconds
+        if stall > 0:
+            # Demo/verification hook: pretend the probe host is slow, so the
+            # UI can show that scheduling keeps moving while probes run.
+            time.sleep(stall)
+        try:
+            return media.artifact_looks_complete(
+                self.settings.ffmpeg_binary,
+                artifact_path,
+                min_seconds=self.settings.clip_seconds,
+            )
+        except Exception:
+            # A probe error must never publish an unverified artifact.
+            return False
+
+    @staticmethod
+    def _find_attempt(batch: Batch | None, attempt_id: str) -> Attempt | None:
+        if batch is None:
+            return None
+        for attempt in batch.attempts():
+            if attempt.id == attempt_id:
+                return attempt
+        return None
+
+    def _finalize_attempt(
+        self,
+        batch: Batch,
+        attempt: Attempt,
+        returncode: int,
+        now: float,
+        *,
+        artifact_ok: bool,
+    ) -> None:
+        """Settle one exited attempt exactly once, with the lock held.
+
+        ``artifact_ok`` comes from the off-lock probe (``False`` for non-zero
+        exits, which need no probe). The selection rules are unchanged: only a
+        complete artifact can be selected, the first selection stands, and a
+        late or cancelled result never replaces it.
+        """
+
         segment = batch.segments[attempt.segment]
         selected = segment.selected_attempt_id is not None
         cancellable_done = attempt.cancel_requested_at is not None
-
-        artifact_ok = returncode == 0 and media.artifact_looks_complete(
-            self.settings.ffmpeg_binary,
-            attempt.artifact_path,
-            min_seconds=self.settings.clip_seconds,
-        )
 
         if selected:
             # A late artifact must never replace the earlier selection.
@@ -581,7 +681,7 @@ class BatchManager:
         for other in segment.attempts:
             if other.id == keep.id:
                 continue
-            if other.status in ("running", "cancelling"):
+            if other.status in ("running", "cancelling", "probing"):
                 self._request_cancel(other, "同段已有成功产物")
             elif other.status == "queued":
                 other.status = "cancelled"
@@ -599,6 +699,10 @@ class BatchManager:
             attempt.finished_at = now
             attempt.error = reason
             return
+        if attempt.status == "probing":
+            # The probe thread owns finalization; it observes the cancel
+            # request when the verdict lands and settles the attempt then.
+            return
         if attempt.status == "running":
             attempt.status = "cancelling"
             attempt.terminate_sent_at = now
@@ -615,7 +719,7 @@ class BatchManager:
         if batch.status == "failed":
             segment.status = "failed" if segment.status == "failed" else "aborted"
             return
-        if any(a.status in ("running", "cancelling") for a in segment.attempts):
+        if any(a.status in ("running", "cancelling", "probing") for a in segment.attempts):
             segment.status = "running"
         elif any(a.status == "queued" for a in segment.attempts):
             segment.status = "pending"
@@ -652,7 +756,7 @@ class BatchManager:
                     continue
                 segment.status = "aborted"
                 for attempt in segment.attempts:
-                    if attempt.status == "running":
+                    if attempt.status in ("running", "probing"):
                         self._request_cancel(attempt, "同批次其他片段已无可用产物")
                     elif attempt.status == "queued":
                         attempt.status = "skipped"

@@ -133,9 +133,12 @@ def test_cancelled_attempt_holds_slot_until_process_exits(started, monkeypatch):
     assert _attempts(final, "A", "first")[0]["slot_held"] is True
     # Then the slot is eventually released after the slow process exits.
     released = started.wait_for(
-        lambda: (lambda b: b if _attempts(b, "A", "first")[0]["slot_held"] is False else None)(
-            started.batch(batch["id"])
-        ),
+        lambda: (
+            lambda b: b
+            if _attempts(b, "A", "first")[0]["slot_held"] is False
+            and _attempts(b, "A", "first")[0]["status"] in ("cancelled", "superseded")
+            else None
+        )(started.batch(batch["id"])),
         timeout=10,
     )
     assert released["slots_used"] <= released["slots_total"]
@@ -338,6 +341,156 @@ def test_artifacts_are_composed_in_clip_order(started, monkeypatch):
     assert len(recorded) == 1
     names = [p.name[0] for p in recorded[0]]
     assert names == ["A", "B", "C"]
+
+
+def test_slow_probe_does_not_freeze_queries_dispatch_or_slots(started):
+    # Every probe stalls for 1.5s. Queries, slot release and the dispatch of
+    # another batch must all keep moving during that window.
+    started.write_fake_config({"sleep": 0.02, "probe_sleep": 1.5})
+    manager = started.manager
+    first = manager.create_batch("A")
+
+    def probing():
+        b = started.batch(first["id"])
+        return b if any(a["status"] == "probing" for a in b["attempts"]) else None
+
+    seen = started.wait_for(probing, timeout=5)
+    # The process has exited, so its slot is already free while the probe runs.
+    probing_attempts = [a for a in seen["attempts"] if a["status"] == "probing"]
+    assert probing_attempts
+    assert all(a["slot_held"] is False for a in probing_attempts)
+
+    # Queries answer immediately while a probe is stalled.
+    t0 = time.monotonic()
+    manager.list_batches()
+    assert time.monotonic() - t0 < 1.0
+
+    # A second batch is dispatched while the first one's probes are stuck.
+    second = manager.create_batch("B")
+
+    def second_running():
+        b1 = started.batch(first["id"])
+        b2 = started.batch(second["id"])
+        still_probing = any(a["status"] == "probing" for a in b1["attempts"])
+        dispatched = any(a["status"] == "running" for a in b2["attempts"])
+        if still_probing and dispatched:
+            return b1, b2
+        return None
+
+    started.wait_for(second_running, timeout=1.0)
+
+    for bid in (first["id"], second["id"]):
+        final = started.wait_for(
+            lambda bid=bid: started.batch(bid)
+            if started.batch(bid)["status"] == "ready"
+            else None,
+            timeout=15,
+        )
+        assert [s["status"] for s in final["segments"]] == ["succeeded"] * 3
+    assert started.batch(first["id"])["slots_used"] == 0
+
+
+def test_failed_probe_rejects_artifact_and_fails_batch(started):
+    # ffmpeg exits 0 and writes an artifact, but the integrity probe rejects
+    # it: the attempt fails and the batch never publishes a final cut.
+    started.write_fake_config({"sleep": 0.02, "probe_exit": 1})
+    manager = started.manager
+    batch = manager.create_batch("A")
+
+    final = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] == "failed"
+        else None,
+        timeout=10,
+    )
+    assert final["download_ready"] is False
+    assert final["download_url"] is None
+    assert manager.get_batch_file(batch["id"]) is None
+    # No attempt may be selected on the strength of an unverified artifact.
+    assert all(s["selected_attempt_id"] is None for s in final["segments"])
+
+    # Cancelled siblings may still be exiting; wait for every attempt to
+    # reach a terminal state before checking the outcomes.
+    settled = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if all(
+            a["status"] not in ("queued", "running", "cancelling", "probing")
+            for a in started.batch(batch["id"])["attempts"]
+        )
+        else None,
+        timeout=10,
+    )
+    statuses = {a["status"] for a in settled["attempts"]}
+    assert statuses <= {"failed", "cancelled"}
+    failed = [a for a in settled["attempts"] if a["status"] == "failed"]
+    assert failed
+    assert all("没有可用的产物" in (a["error"] or "") for a in failed)
+    # Rejected artifacts are removed from disk.
+    work = started.settings.work_dir / batch["id"]
+    assert list(work.glob("*.mp4")) == []
+
+
+def test_cancel_during_probe_settles_once_and_keeps_first_selection(started, monkeypatch):
+    # The slow first run exits while the backup's probe is still in flight.
+    # Cancelling the probing first run must not finalize it early; when its
+    # own probe lands it is settled exactly once, as superseded, and the
+    # earlier selection is untouched.
+    #
+    # Timing uses the in-process probe stall (not the fake's subprocess
+    # sleep) so thread wake-ups are precise: the backup's probe lands at
+    # ~2.4s, the first run's at ~3.5s — a gap process jitter cannot flip.
+    started.settings.probe_stall_seconds = 2.0
+    started.write_fake_config(
+        {
+            "segments": {"A": {"slow": {"sleep": 1.5}, "normal": {"sleep": 0.02}}},
+            "sleep": 0.02,
+        }
+    )
+    manager = started.manager
+    finalized: list[str] = []
+    original = manager._finalize_attempt
+
+    def spy(batch, attempt, returncode, now, *, artifact_ok):
+        finalized.append(attempt.id)
+        return original(batch, attempt, returncode, now, artifact_ok=artifact_ok)
+
+    monkeypatch.setattr(manager, "_finalize_attempt", spy)
+    batch = manager.create_batch("A")
+
+    def first_probing():
+        b = started.batch(batch["id"])
+        first = _attempts(b, "A", "first")[0]
+        return b if first["status"] == "probing" else None
+
+    started.wait_for(first_probing, timeout=5)
+    final = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] == "ready"
+        else None,
+        timeout=15,
+    )
+    selected = _segment(final, "A")["selected_attempt_id"]
+    backup = _attempts(final, "A", "backup")[0]
+    assert selected == backup["id"]
+
+    def first_settled():
+        b = started.batch(batch["id"])
+        first = _attempts(b, "A", "first")[0]
+        return b if first["status"] in ("superseded", "cancelled") else None
+
+    settled = started.wait_for(first_settled, timeout=15)
+    first = _attempts(settled, "A", "first")[0]
+    assert first["status"] == "superseded"
+    assert first["cancel_reason"] == "同段已有成功产物"
+    assert _segment(settled, "A")["selected_attempt_id"] == selected
+    # Every attempt was finalized exactly once, even the one whose cancel
+    # arrived while its probe was in flight.
+    assert sorted(finalized) == sorted(set(finalized))
+    assert set(finalized) == {a["id"] for a in settled["attempts"]}
+    # The selected artifact is intact; the late one is gone.
+    work = started.settings.work_dir / batch["id"]
+    assert (work / f"A_{selected}.mp4").is_file()
+    assert not (work / f"A_{first['id']}.mp4").exists()
 
 
 def test_pick_next_candidate_prioritises_unstarted_segments():

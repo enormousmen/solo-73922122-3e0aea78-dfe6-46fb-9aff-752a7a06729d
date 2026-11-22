@@ -9,6 +9,9 @@ services:
       TRANSCODE_SLOTS: "2"
       SLOW_AFTER_SECONDS: "2.0"
       SLOW_READRATE: "0.4"
+      # 演示开关：让每次产物完整性探测人为变慢（秒）。探测期间页面查询、
+      # 新批次派发与槽位回收都不应停住。正式使用设为 "0" 或删除该行。
+      PROBE_STALL_SECONDS: "6"
     volumes:
       - preview-data:/data
     healthcheck:

@@ -65,6 +65,9 @@ def segment_for(output: Path) -> str:
 def main(argv: list[str]) -> int:
     config = load_config()
     if "-i" in argv and "-f" in argv and argv[-1] == "-":
+        probe_sleep = float(config.get("probe_sleep", 0))
+        if probe_sleep > 0:
+            time.sleep(probe_sleep)
         emit_duration(float(config.get("probe_seconds", 4.0)))
         return int(config.get("probe_exit", 0))
 

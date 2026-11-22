@@ -61,6 +61,9 @@ class Settings:
         # Composition can start while cancelled ffmpeg processes are still
         # exiting; this is how long cleanup may take before we give up waiting.
         self.shutdown_grace_seconds = max(0.0, _env_float("SHUTDOWN_GRACE_SECONDS", 8.0))
+        # Demo/verification hook: artificial delay inside the integrity probe,
+        # to show that a slow probe no longer freezes queries or scheduling.
+        self.probe_stall_seconds = max(0.0, _env_float("PROBE_STALL_SECONDS", 0.0))
         self.clip_names = ("A", "B", "C")
 
     @property

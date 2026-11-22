@@ -149,6 +149,7 @@ button:disabled { opacity: .55; cursor: wait; }
 .s-queued { background: var(--muted); }
 .s-running { background: var(--accent); box-shadow: 0 0 0 3px rgba(90, 169, 255, .18); }
 .s-cancelling { background: var(--cancel); }
+.s-probing { background: var(--warn); box-shadow: 0 0 0 3px rgba(242, 184, 75, .16); }
 .s-succeeded { background: var(--good); }
 .s-failed { background: var(--bad); }
 .s-cancelled, .s-superseded, .s-skipped { background: #5c6a7c; }

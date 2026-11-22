@@ -15,6 +15,7 @@
     queued: "排队中",
     running: "转码中",
     cancelling: "取消中（仍占槽）",
+    probing: "校验产物中",
     succeeded: "成功",
     failed: "失败",
     cancelled: "已取消",

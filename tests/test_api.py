@@ -114,3 +114,54 @@ def test_failed_batch_has_no_download(client):
     assert final["download_ready"] is False
     response = client.get(f"/batches/{created['id']}/download")
     assert response.status_code == 409
+
+
+def test_api_stays_responsive_during_slow_probe(client):
+    FAKE_CONFIG.write_text(
+        json.dumps({"sleep": 0.02, "probe_sleep": 1.5}), encoding="utf-8"
+    )
+    created = client.post("/api/batches", json={"slow_clip": "A"}).json()
+
+    deadline = time.monotonic() + 5
+    while True:
+        body = client.get(f"/api/batches/{created['id']}").json()
+        if any(a["status"] == "probing" for a in body["attempts"]):
+            break
+        assert time.monotonic() < deadline, "no attempt reached probing"
+        time.sleep(0.02)
+
+    # The list endpoint answers immediately while a probe is stalled.
+    t0 = time.monotonic()
+    response = client.get("/api/batches")
+    assert response.status_code == 200
+    assert time.monotonic() - t0 < 1.0
+
+    # And a second batch is dispatched during the probe window.
+    second = client.post("/api/batches", json={"slow_clip": "B"}).json()
+    still_probing = dispatched = False
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        first_body = client.get(f"/api/batches/{created['id']}").json()
+        second_body = client.get(f"/api/batches/{second['id']}").json()
+        still_probing = any(a["status"] == "probing" for a in first_body["attempts"])
+        dispatched = any(a["status"] == "running" for a in second_body["attempts"])
+        if still_probing and dispatched:
+            break
+        time.sleep(0.02)
+    assert still_probing and dispatched
+
+    assert wait_ready(client, created["id"], timeout=15)["status"] == "ready"
+    assert wait_ready(client, second["id"], timeout=15)["status"] == "ready"
+
+
+def test_failed_probe_has_no_download(client):
+    # The transcode exits 0 but the integrity probe rejects the artifact.
+    FAKE_CONFIG.write_text(
+        json.dumps({"sleep": 0.02, "probe_exit": 1}), encoding="utf-8"
+    )
+    created = client.post("/api/batches", json={"slow_clip": "A"}).json()
+    final = wait_ready(client, created["id"])
+    assert final["status"] == "failed"
+    assert final["download_ready"] is False
+    response = client.get(f"/batches/{created['id']}/download")
+    assert response.status_code == 409

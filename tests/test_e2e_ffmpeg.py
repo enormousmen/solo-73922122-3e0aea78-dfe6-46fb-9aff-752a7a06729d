@@ -93,10 +93,15 @@ def test_real_ffmpeg_slow_a_produces_ordered_cut(tmp_path: Path):
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
             data = manager.get_batch(batch["id"])
-            if all(a["status"] not in ("running", "cancelling") for a in data["attempts"]):
+            if all(
+                a["status"] not in ("running", "cancelling", "probing")
+                for a in data["attempts"]
+            ):
                 break
             time.sleep(0.1)
-        assert all(a["status"] not in ("running", "cancelling") for a in data["attempts"])
+        assert all(
+            a["status"] not in ("running", "cancelling", "probing") for a in data["attempts"]
+        )
         assert data["slots_used"] == 0
     finally:
         manager.shutdown()
